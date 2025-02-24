@@ -1,0 +1,215 @@
+// package.json
+{
+  "name": "discord-music-bot",
+  "version": "1.0.0",
+  "description": "Discord music bot with YouTube and Spotify support",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "@discordjs/voice": "^0.16.1",
+    "@discordjs/opus": "^0.9.0",
+    "ytdl-core": "^4.11.5",
+    "spotify-web-api-node": "^5.0.2",
+    "yt-search": "^2.10.4",
+    "ffmpeg-static": "^5.2.0",
+    "sodium-native": "^4.0.4",
+    "dotenv": "^16.3.1"
+  }
+}
+
+// .env
+TOKEN=your_discord_bot_token
+SPOTIFY_CLIENT_ID=your_spotify_client_id
+SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
+
+// index.js
+require('dotenv').config();
+const { Client, GatewayIntentBits, ActivityType } = require('discord.js');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const ytdl = require('ytdl-core');
+const SpotifyWebApi = require('spotify-web-api-node');
+const yts = require('yt-search');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent
+  ]
+});
+
+const queues = new Map();
+const spotify = new SpotifyWebApi({
+  clientId: process.env.SPOTIFY_CLIENT_ID,
+  clientSecret: process.env.SPOTIFY_CLIENT_SECRET
+});
+
+// Refresh Spotify access token
+async function refreshSpotifyToken() {
+  try {
+    const data = await spotify.clientCredentialsGrant();
+    spotify.setAccessToken(data.body['access_token']);
+    setTimeout(refreshSpotifyToken, (data.body['expires_in'] - 60) * 1000);
+  } catch (err) {
+    console.error('Error refreshing Spotify token:', err);
+  }
+}
+
+class MusicQueue {
+  constructor() {
+    this.queue = [];
+    this.player = createAudioPlayer();
+    this.playing = false;
+    this.connection = null;
+  }
+}
+
+async function playNext(guildId) {
+  const queue = queues.get(guildId);
+  if (!queue || queue.queue.length === 0) {
+    queue.playing = false;
+    return;
+  }
+
+  const track = queue.queue.shift();
+  try {
+    let stream;
+    if (track.platform === 'youtube') {
+      stream = ytdl(track.url, { filter: 'audioonly', quality: 'highestaudio' });
+    } else {
+      // For Spotify tracks, search equivalent on YouTube
+      const searchResults = await yts(track.title);
+      stream = ytdl(searchResults.videos[0].url, { filter: 'audioonly', quality: 'highestaudio' });
+    }
+
+    const resource = createAudioResource(stream);
+    queue.player.play(resource);
+    queue.playing = true;
+  } catch (err) {
+    console.error('Error playing track:', err);
+    playNext(guildId);
+  }
+}
+
+client.on('ready', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  client.user.setActivity('music | !help', { type: ActivityType.Listening });
+  refreshSpotifyToken();
+});
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith('!')) return;
+
+  const args = message.content.slice(1).trim().split(/ +/);
+  const command = args.shift().toLowerCase();
+
+  switch (command) {
+    case 'play':
+      if (!message.member.voice.channel) {
+        return message.reply('You need to be in a voice channel!');
+      }
+
+      const url = args[0];
+      if (!url) {
+        return message.reply('Please provide a YouTube or Spotify URL!');
+      }
+
+      let queue = queues.get(message.guildId);
+      if (!queue) {
+        queue = new MusicQueue();
+        queues.set(message.guildId, queue);
+      }
+
+      try {
+        if (!queue.connection) {
+          queue.connection = joinVoiceChannel({
+            channelId: message.member.voice.channel.id,
+            guildId: message.guild.id,
+            adapterCreator: message.guild.voiceAdapterCreator,
+          });
+          queue.connection.subscribe(queue.player);
+        }
+
+        if (url.includes('spotify.com')) {
+          const trackId = url.split('/').pop().split('?')[0];
+          const track = await spotify.getTrack(trackId);
+          queue.queue.push({
+            title: `${track.body.name} - ${track.body.artists[0].name}`,
+            platform: 'spotify'
+          });
+        } else if (url.includes('youtube.com') || url.includes('youtu.be')) {
+          const info = await ytdl.getInfo(url);
+          queue.queue.push({
+            url,
+            title: info.videoDetails.title,
+            platform: 'youtube'
+          });
+        } else {
+          return message.reply('Invalid URL! Please provide a YouTube or Spotify link.');
+        }
+
+        message.reply(`Added to queue: ${queue.queue[queue.queue.length - 1].title}`);
+
+        if (!queue.playing) {
+          playNext(message.guildId);
+        }
+      } catch (err) {
+        console.error('Error adding track:', err);
+        message.reply('Error adding track to queue!');
+      }
+      break;
+
+    case 'skip':
+      const skipQueue = queues.get(message.guildId);
+      if (skipQueue && skipQueue.playing) {
+        skipQueue.player.stop();
+        message.reply('Skipped current track!');
+      }
+      break;
+
+    case 'stop':
+      const stopQueue = queues.get(message.guildId);
+      if (stopQueue) {
+        stopQueue.queue = [];
+        stopQueue.player.stop();
+        stopQueue.connection.destroy();
+        queues.delete(message.guildId);
+        message.reply('Stopped playback and cleared queue!');
+      }
+      break;
+
+    case 'queue':
+      const currentQueue = queues.get(message.guildId);
+      if (!currentQueue || currentQueue.queue.length === 0) {
+        message.reply('Queue is empty!');
+      } else {
+        const queueList = currentQueue.queue
+          .map((track, index) => `${index + 1}. ${track.title}`)
+          .join('\n');
+        message.reply(`Current queue:\n${queueList}`);
+      }
+      break;
+
+    case 'help':
+      message.reply(
+        'Available commands:\n' +
+        '!play <YouTube/Spotify URL> - Play a track\n' +
+        '!skip - Skip current track\n' +
+        '!stop - Stop playback and clear queue\n' +
+        '!queue - Show current queue'
+      );
+      break;
+  }
+});
+
+client.on('error', console.error);
+queue.player.on(AudioPlayerStatus.Idle, () => {
+  playNext(message.guildId);
+});
+
+client.login(process.env.TOKEN);
