@@ -1,0 +1,39 @@
+const SpotifyWebApi = require('spotify-web-api-node');
+const config = require('../config/config');
+const yts = require('yt-search');
+
+class SpotifyHandler {
+    constructor() {
+        this.spotify = new SpotifyWebApi({
+            clientId: config.spotifyClientId,
+            clientSecret: config.spotifyClientSecret
+        });
+        this.refreshToken();
+    }
+
+    async refreshToken() {
+        try {
+            const data = await this.spotify.clientCredentialsGrant();
+            this.spotify.setAccessToken(data.body['access_token']);
+            setTimeout(() => this.refreshToken(), (data.body['expires_in'] - 60) * 1000);
+        } catch (err) {
+            console.error('Error refreshing Spotify token:', err);
+        }
+    }
+
+    async handleSpotifyURL(url) {
+        const trackId = url.split('/').pop().split('?')[0];
+        const track = await this.spotify.getTrack(trackId);
+        const searchQuery = `${track.body.name} ${track.body.artists[0].name}`;
+        
+        // Search for equivalent YouTube video
+        const searchResults = await yts(searchQuery);
+        return {
+            title: `${track.body.name} - ${track.body.artists[0].name}`,
+            youtubeUrl: searchResults.videos[0].url,
+            platform: 'spotify'
+        };
+    }
+}
+
+module.exports = new SpotifyHandler();
